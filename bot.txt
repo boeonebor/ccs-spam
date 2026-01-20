@@ -1,0 +1,508 @@
+cat > bot.js << 'BOTCODE'
+require('dotenv').config();
+const { Telegraf, Markup } = require('telegraf');
+const mysql = require('mysql2/promise');
+
+const bot = new Telegraf(process.env.BOT_TOKEN);
+const ADMIN_ID = process.env.ADMIN_ID;
+
+// Database connection
+const db = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASS,
+  database: process.env.DB_NAME
+});
+
+// In-memory pending payments (nanti bisa pake database)
+const pendingPayments = new Map();
+
+// ==================== USER COMMANDS ====================
+
+// /start
+bot.start((ctx) => {
+  const userName = ctx.from.first_name || 'Friend';
+  ctx.reply(
+    `🎉 *Welcome ${userName}!*\n\n` +
+    `📞 *Premium US Virtual Numbers*\n` +
+    `💰 Starting from $10/month\n` +
+    `🔥 Proven high-traffic numbers\n` +
+    `⚡ Instant activation\n\n` +
+    `Choose an option below:`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('🔥 Premium Numbers', 'premium')],
+        [Markup.button.callback('🔎 Search by Area', 'search')],
+        [Markup.button.callback('📱 My Numbers', 'mynumbers')],
+        [Markup.button.callback('❓ Help', 'help')]
+      ])
+    }
+  );
+});
+
+// Premium numbers
+bot.action('premium', async (ctx) => {
+  try {
+    await ctx.answerCbQuery();
+    
+    const [rows] = await db.query(`
+      SELECT calleee164, COUNT(*) as calls 
+      FROM e_cdr_20250220 
+      GROUP BY calleee164 
+      HAVING calls > 100
+      ORDER BY calls DESC 
+      LIMIT 10
+    `);
+    
+    if (rows.length === 0) {
+      return ctx.editMessageText('No premium numbers available right now.');
+    }
+    
+    let message = '🔥 *TOP PREMIUM NUMBERS*\n\n';
+    message += '_These numbers have proven high traffic!_\n\n';
+    
+    const keyboard = [];
+    
+    rows.forEach((row, i) => {
+      const formattedNumber = `+${row.calleee164}`;
+      const price = row.calls > 5000 ? 15 : row.calls > 1000 ? 12 : 10;
+      message += `${i+1}. ${formattedNumber}\n   📊 ${row.calls.toLocaleString()} calls | 💰 $${price}/mo\n\n`;
+      
+      keyboard.push([
+        Markup.button.callback(
+          `Buy ${formattedNumber} - $${price}/mo`,
+          `buy_${row.calleee164}_${price}`
+        )
+      ]);
+    });
+    
+    keyboard.push([Markup.button.callback('« Back', 'back_home')]);
+    
+    await ctx.editMessageText(message, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard(keyboard)
+    });
+  } catch (error) {
+    console.error('Premium error:', error);
+    ctx.reply('Error loading premium numbers. Please try /start again.');
+  }
+});
+
+// Search by area
+bot.action('search', async (ctx) => {
+  await ctx.answerCbQuery();
+  
+  const areas = [
+    { code: '213', city: 'Los Angeles', state: 'CA' },
+    { code: '212', city: 'New York', state: 'NY' },
+    { code: '415', city: 'San Francisco', state: 'CA' },
+    { code: '305', city: 'Miami', state: 'FL' },
+    { code: '702', city: 'Las Vegas', state: 'NV' },
+    { code: '312', city: 'Chicago', state: 'IL' }
+  ];
+  
+  let message = '🔎 *SEARCH BY AREA CODE*\n\nSelect a city:\n\n';
+  const keyboard = areas.map(area => [
+    Markup.button.callback(
+      `${area.city}, ${area.state} (${area.code})`,
+      `area_${area.code}`
+    )
+  ]);
+  
+  keyboard.push([Markup.button.callback('« Back', 'back_home')]);
+  
+  await ctx.editMessageText(message, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard(keyboard)
+  });
+});
+
+// Area code search
+bot.action(/area_(.+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const areaCode = ctx.match[1];
+  
+  try {
+    const [rows] = await db.query(`
+      SELECT DISTINCT calleee164, COUNT(*) as calls
+      FROM e_cdr_20250220
+      WHERE calleee164 LIKE '1${areaCode}%'
+      GROUP BY calleee164
+      ORDER BY calls DESC
+      LIMIT 10
+    `);
+    
+    if (rows.length === 0) {
+      return ctx.editMessageText(
+        `No numbers available for area ${areaCode} right now.\n\nTry another area or check premium numbers!`,
+        Markup.inlineKeyboard([[Markup.button.callback('« Back', 'search')]])
+      );
+    }
+    
+    let message = `📍 *AREA ${areaCode} NUMBERS*\n\n`;
+    const keyboard = [];
+    
+    rows.forEach((row, i) => {
+      const formattedNumber = `+${row.calleee164}`;
+      message += `${i+1}. ${formattedNumber} (${row.calls} calls)\n`;
+      
+      keyboard.push([
+        Markup.button.callback(`Buy ${formattedNumber} - $10/mo`, `buy_${row.calleee164}_10`)
+      ]);
+    });
+    
+    keyboard.push([Markup.button.callback('« Back', 'search')]);
+    
+    await ctx.editMessageText(message, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard(keyboard)
+    });
+  } catch (error) {
+    console.error('Area search error:', error);
+    ctx.reply('Error searching numbers. Try again!');
+  }
+});
+
+// Buy number
+bot.action(/buy_(.+)_(.+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const number = ctx.match[1];
+  const price = ctx.match[2];
+  const userId = ctx.from.id;
+  const userName = ctx.from.first_name || 'User';
+  
+  // Store pending payment
+  const paymentId = `${userId}_${Date.now()}`;
+  pendingPayments.set(paymentId, {
+    userId,
+    userName,
+    number,
+    price,
+    timestamp: new Date()
+  });
+  
+  const message = 
+    `✅ *PURCHASE CONFIRMATION*\n\n` +
+    `📞 Number: +${number}\n` +
+    `💰 Price: $${price}/month\n` +
+    `👤 Buyer: ${userName}\n\n` +
+    `*PAYMENT INSTRUCTIONS:*\n` +
+    `1️⃣ Scan QRIS code below\n` +
+    `2️⃣ Pay $${price} USD\n` +
+    `3️⃣ Screenshot payment proof\n` +
+    `4️⃣ Send screenshot to this bot\n` +
+    `5️⃣ Wait for admin approval (< 5 min)\n\n` +
+    `⚠️ Payment ID: \`${paymentId}\`\n` +
+    `_Include this ID in your screenshot!_`;
+  
+  await ctx.editMessageText(message, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'back_home')]])
+  });
+  
+  // Send QRIS barcode (you'll upload your QRIS image)
+  // For now, send payment instructions
+  setTimeout(async () => {
+    await ctx.reply(
+      `📲 *QRIS PAYMENT*\n\n` +
+      `Scan this code with OVO/DANA/GoPay:\n\n` +
+      `[ADMIN: Upload your QRIS image here]\n\n` +
+      `After payment, send screenshot with Payment ID: \`${paymentId}\``,
+      { parse_mode: 'Markdown' }
+    );
+  }, 1000);
+  
+  // Notify admin
+  if (ADMIN_ID) {
+    bot.telegram.sendMessage(
+      ADMIN_ID,
+      `🔔 *NEW PURCHASE REQUEST*\n\n` +
+      `👤 User: ${userName} (${userId})\n` +
+      `📞 Number: +${number}\n` +
+      `💰 Price: $${price}\n` +
+      `🆔 Payment ID: ${paymentId}\n\n` +
+      `Waiting for payment proof...`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+});
+
+// Handle photo uploads (payment proof)
+bot.on('photo', async (ctx) => {
+  const userId = ctx.from.id;
+  const userName = ctx.from.first_name;
+  
+  // Find pending payment for this user
+  let userPayment = null;
+  for (const [paymentId, payment] of pendingPayments.entries()) {
+    if (payment.userId === userId) {
+      userPayment = { paymentId, ...payment };
+      break;
+    }
+  }
+  
+  if (!userPayment) {
+    return ctx.reply(
+      '⚠️ No pending payment found!\n\n' +
+      'Please select a number first using /start'
+    );
+  }
+  
+  await ctx.reply(
+    '✅ *Payment proof received!*\n\n' +
+    '⏳ Admin is reviewing your payment...\n' +
+    '⚡ You will be notified within 5 minutes.\n\n' +
+    '_Thank you for your patience!_',
+    { parse_mode: 'Markdown' }
+  );
+  
+  // Forward to admin
+  if (ADMIN_ID) {
+    await ctx.telegram.sendPhoto(ADMIN_ID, ctx.message.photo[0].file_id);
+    await bot.telegram.sendMessage(
+      ADMIN_ID,
+      `💳 *PAYMENT PROOF RECEIVED*\n\n` +
+      `👤 User: ${userName} (${userId})\n` +
+      `📞 Number: +${userPayment.number}\n` +
+      `💰 Amount: $${userPayment.price}\n` +
+      `🆔 Payment ID: ${userPayment.paymentId}\n\n` +
+      `*ADMIN ACTIONS:*\n` +
+      `/approve ${userId} ${userPayment.number}\n` +
+      `/reject ${userId}`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+});
+
+// My numbers
+bot.action('mynumbers', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  
+  // In production, query from database where customer_id = userId
+  // For now, just show message
+  await ctx.editMessageText(
+    '📱 *MY NUMBERS*\n\n' +
+    'You don\'t have any active numbers yet.\n\n' +
+    'Purchase your first number now!',
+    Markup.inlineKeyboard([[Markup.button.callback('🔥 Buy Now', 'premium')]])
+  );
+});
+
+// Help
+bot.action('help', async (ctx) => {
+  await ctx.answerCbQuery();
+  
+  const helpText = 
+    '❓ *HELP & FAQ*\n\n' +
+    '*What are virtual numbers?*\n' +
+    'US phone numbers that forward calls/SMS to your device.\n\n' +
+    '*How does payment work?*\n' +
+    '1. Choose number\n' +
+    '2. Scan QRIS (OVO/DANA/GoPay)\n' +
+    '3. Send proof\n' +
+    '4. Get activated!\n\n' +
+    '*Activation time?*\n' +
+    'Within 5 minutes after payment approval.\n\n' +
+    '*Monthly billing?*\n' +
+    'Auto-renewal. Cancel anytime.\n\n' +
+    '*Support?*\n' +
+    'Contact admin: @YOUR_USERNAME';
+  
+  await ctx.editMessageText(helpText, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('« Back', 'back_home')]])
+  });
+});
+
+// Back to home
+bot.action('back_home', (ctx) => {
+  ctx.answerCbQuery();
+  ctx.deleteMessage();
+  ctx.replyWithMarkdown(
+    '🏠 *Main Menu*\n\nWhat would you like to do?',
+    Markup.inlineKeyboard([
+      [Markup.button.callback('🔥 Premium Numbers', 'premium')],
+      [Markup.button.callback('🔎 Search by Area', 'search')],
+      [Markup.button.callback('📱 My Numbers', 'mynumbers')],
+      [Markup.button.callback('❓ Help', 'help')]
+    ])
+  );
+});
+
+// ==================== ADMIN COMMANDS ====================
+
+// Admin panel
+bot.command('admin', (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) {
+    return ctx.reply('⛔ Admin only!');
+  }
+  
+  const pendingCount = pendingPayments.size;
+  
+  ctx.reply(
+    `🔐 *ADMIN PANEL*\n\n` +
+    `📊 Pending payments: ${pendingCount}\n\n` +
+    `*Commands:*\n` +
+    `/pending - View all pending\n` +
+    `/approve <user_id> <number> - Approve\n` +
+    `/reject <user_id> - Reject\n` +
+    `/stats - View statistics`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// View pending
+bot.command('pending', (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) {
+    return ctx.reply('⛔ Admin only!');
+  }
+  
+  if (pendingPayments.size === 0) {
+    return ctx.reply('✅ No pending payments!');
+  }
+  
+  let message = '📋 *PENDING PAYMENTS*\n\n';
+  
+  for (const [paymentId, payment] of pendingPayments.entries()) {
+    message += 
+      `👤 ${payment.userName} (${payment.userId})\n` +
+      `📞 +${payment.number}\n` +
+      `💰 $${payment.price}\n` +
+      `🆔 ${paymentId}\n` +
+      `⏰ ${payment.timestamp.toLocaleString()}\n\n` +
+      `Approve: /approve ${payment.userId} ${payment.number}\n` +
+      `Reject: /reject ${payment.userId}\n` +
+      `─────────────\n\n`;
+  }
+  
+  ctx.reply(message, { parse_mode: 'Markdown' });
+});
+
+// Approve payment
+bot.command('approve', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) {
+    return ctx.reply('⛔ Admin only!');
+  }
+  
+  const args = ctx.message.text.split(' ');
+  if (args.length < 3) {
+    return ctx.reply('Usage: /approve <user_id> <number>');
+  }
+  
+  const userId = args[1];
+  const number = args[2];
+  
+  // Find and remove from pending
+  let found = false;
+  for (const [paymentId, payment] of pendingPayments.entries()) {
+    if (payment.userId.toString() === userId && payment.number === number) {
+      pendingPayments.delete(paymentId);
+      found = true;
+      
+      // Notify user
+      bot.telegram.sendMessage(
+        userId,
+        `🎉 *PAYMENT APPROVED!*\n\n` +
+        `📞 Your number +${number} is now ACTIVE!\n\n` +
+        `✅ You can start using it immediately.\n` +
+        `📱 View your numbers: /start → My Numbers\n\n` +
+        `Thank you for your purchase! 🙏`,
+        { parse_mode: 'Markdown' }
+      );
+      
+      // TODO: Actually assign number in database
+      // INSERT INTO user_numbers (user_id, did, activated_at) VALUES (...)
+      
+      break;
+    }
+  }
+  
+  if (found) {
+    ctx.reply(`✅ Approved! User ${userId} notified.`);
+  } else {
+    ctx.reply(`❌ Payment not found for user ${userId} and number ${number}`);
+  }
+});
+
+// Reject payment
+bot.command('reject', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) {
+    return ctx.reply('⛔ Admin only!');
+  }
+  
+  const args = ctx.message.text.split(' ');
+  if (args.length < 2) {
+    return ctx.reply('Usage: /reject <user_id>');
+  }
+  
+  const userId = args[1];
+  
+  // Find and remove from pending
+  let found = false;
+  for (const [paymentId, payment] of pendingPayments.entries()) {
+    if (payment.userId.toString() === userId) {
+      pendingPayments.delete(paymentId);
+      found = true;
+      
+      // Notify user
+      bot.telegram.sendMessage(
+        userId,
+        `❌ *PAYMENT REJECTED*\n\n` +
+        `Your payment was not approved.\n\n` +
+        `Possible reasons:\n` +
+        `• Incorrect amount\n` +
+        `• Invalid payment proof\n` +
+        `• Number no longer available\n\n` +
+        `Please contact admin for details.`,
+        { parse_mode: 'Markdown' }
+      );
+      
+      break;
+    }
+  }
+  
+  if (found) {
+    ctx.reply(`✅ Rejected! User ${userId} notified.`);
+  } else {
+    ctx.reply(`❌ No pending payment found for user ${userId}`);
+  }
+});
+
+// Stats
+bot.command('stats', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) {
+    return ctx.reply('⛔ Admin only!');
+  }
+  
+  try {
+    // Get total DIDs
+    const [dids] = await db.query('SELECT COUNT(DISTINCT calleee164) as total FROM e_cdr_20250220');
+    
+    // Get total calls
+    const [calls] = await db.query('SELECT COUNT(*) as total FROM e_cdr_20250220');
+    
+    ctx.reply(
+      `📊 *STATISTICS*\n\n` +
+      `📞 Total DIDs: ${dids[0].total.toLocaleString()}\n` +
+      `📈 Total calls (Feb 20): ${calls[0].total.toLocaleString()}\n` +
+      `⏳ Pending payments: ${pendingPayments.size}\n\n` +
+      `Server: Running ✅`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (error) {
+    ctx.reply('Error fetching stats.');
+  }
+});
+
+// Start bot
+bot.launch();
+console.log('🤖 DID Marketplace Bot is running!');
+
+// Enable graceful stop
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+BOTCODE
+
+echo "✅ Bot code created!"
